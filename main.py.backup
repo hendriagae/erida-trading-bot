@@ -1,0 +1,415 @@
+# ============================================================
+# main.py — File utama AOS Trading Bot
+# Jalankan: python main.py
+# ============================================================
+
+import asyncio
+import sys
+import time
+from datetime import datetime
+from loguru import logger
+
+# Setup logging
+logger.remove()
+logger.add(sys.stdout, level="INFO",
+           format="<green>{time:HH:mm:ss}</green> | <level>{level}</level> | {message}")
+logger.add("logs/bot.log", level="DEBUG", rotation="10 MB")
+
+from config import SYMBOL, IS_PAPER, TESTNET, BOT_MODE
+from data.database import init_database
+from data.binance_rest import (get_usdt_balance, get_klines,
+                                get_funding_rate, get_open_interest,
+                                set_leverage, set_margin_mode)
+from data.binance_ws import start_all_streams, current_price
+from data.external_data import get_macro_bias
+from engine.volume_profile import (build_volume_profile,
+                                   get_market_state, find_nearest_lvn,
+                                   detect_profile_shape)
+from engine.signal_scorer import calculate_signal_score
+from strategy.position_sizer import (calculate_position_size,
+                                     calculate_sl_tp, calculate_atr)
+from risk.risk_manager import RiskManager
+from risk.kill_switch import activate_kill_switch
+from execution.order_manager import (place_market_order,
+                                     place_sl_order, place_tp_order,
+                                     get_position_info)
+from monitor.telegram_alert import (notify_entry, notify_signal,
+                                    notify_daily_summary, notify_error,
+                                    send_message)
+from data.database import save_trade, save_signal, get_today_trades
+
+
+# ── STATE GLOBAL ─────────────────────────────────────────────
+state = {
+    "balance"        : 0.0,
+    "risk_manager"   : None,
+    "vp"             : {},
+    "macro_bias"     : {},
+    "klines"         : [],
+    "last_signal"    : None,
+    "last_vp_update" : 0,
+    "last_macro_update": 0,
+    "open_trade_id"  : None,
+    "running"        : True,
+    "consecutive_losses": 0,
+}
+
+VP_UPDATE_INTERVAL    = 300   # update VP setiap 5 menit
+MACRO_UPDATE_INTERVAL = 3600  # update macro setiap 1 jam
+MAIN_LOOP_INTERVAL    = 30    # cek sinyal setiap 30 detik
+
+
+# ── SETUP ────────────────────────────────────────────────────
+def setup():
+    """Inisialisasi semua komponen."""
+    logger.info("="*50)
+    logger.info("🚀 AOS TRADING BOT STARTING")
+    logger.info(f"   Mode: {BOT_MODE.upper()}")
+    logger.info(f"   Testnet: {TESTNET}")
+    logger.info(f"   Symbol: {SYMBOL}")
+    logger.info("="*50)
+
+    # Init database
+    init_database()
+
+    # Set leverage & margin mode
+    if not IS_PAPER:
+        set_leverage(SYMBOL, 10)
+        set_margin_mode(SYMBOL, "ISOLATED")
+
+    # Load balance
+    balance = get_usdt_balance()
+    if balance == 0 and not IS_PAPER:
+        logger.error("Balance = 0. Cek koneksi Binance!")
+        sys.exit(1)
+
+    if IS_PAPER:
+        balance = 1000.0  # virtual balance untuk paper trading
+        logger.info(f"[PAPER] Virtual balance: ${balance}")
+    else:
+        logger.info(f"Balance: ${balance:,.2f} USDT")
+
+    state["balance"]      = balance
+    state["risk_manager"] = RiskManager(balance)
+
+    # Initial data load
+    _update_klines()
+    _update_volume_profile()
+    _update_macro()
+
+    send_message(
+        f"🤖 <b>AOS Bot Started</b>\n"
+        f"Mode: {BOT_MODE.upper()} | Testnet: {TESTNET}\n"
+        f"Balance: ${balance:,.2f}"
+    )
+    logger.info("✅ Setup complete")
+
+
+# ── DATA UPDATERS ────────────────────────────────────────────
+def _update_klines():
+    """Refresh data klines OHLCV."""
+    klines = get_klines(SYMBOL, interval="1m", limit=200)
+    if klines:
+        state["klines"] = klines
+        logger.debug(f"Klines updated: {len(klines)} bars")
+
+
+def _update_volume_profile():
+    """Rebuild Volume Profile dari klines terbaru."""
+    if not state["klines"]:
+        return
+    vp = build_volume_profile(state["klines"], bins=50)
+    if vp:
+        state["vp"]             = vp
+        state["last_vp_update"] = time.time()
+        shape = detect_profile_shape(vp)
+        logger.info(f"📊 VP Updated | POC: {vp['poc']:.2f} | "
+                    f"VAH: {vp['vah']:.2f} | VAL: {vp['val']:.2f} | "
+                    f"Shape: {shape}")
+
+
+def _update_macro():
+    """Refresh data makro eksternal."""
+    try:
+        macro = get_macro_bias()
+        state["macro_bias"]         = macro
+        state["last_macro_update"]  = time.time()
+        logger.info(f"🌍 Macro Bias: {macro['bias']} "
+                    f"(score: {macro['score']})")
+    except Exception as e:
+        logger.error(f"Macro update error: {e}")
+
+
+# ── MAIN TRADING LOGIC ───────────────────────────────────────
+def check_and_trade():
+    """
+    Logic utama: cek sinyal → validasi risk → eksekusi.
+    Dipanggil setiap MAIN_LOOP_INTERVAL detik.
+    """
+    # Update data berkala
+    now = time.time()
+    _update_klines()
+
+    if now - state["last_vp_update"] > VP_UPDATE_INTERVAL:
+        _update_volume_profile()
+
+    if now - state["last_macro_update"] > MACRO_UPDATE_INTERVAL:
+        _update_macro()
+
+    # Skip jika data belum siap
+    if not state["vp"] or not state["klines"]:
+        logger.debug("Waiting for data...")
+        return
+
+    import data.binance_ws as ws_module
+    price = ws_module.current_price
+
+    import data.binance_ws as _ws
+    price = _ws.current_price
+
+    if price == 0:
+    # Fallback: ambil harga dari REST API
+    from data.binance_rest import get_ticker_price
+    price = get_ticker_price()
+    if price > 0:
+        _ws.current_price = price
+        logger.info(f"💲 Price from REST fallback: ${price:,.2f}")
+    else:
+        logger.debug("Price = 0, waiting...")
+        return
+
+    # ── RISK CHECK ───────────────────────────────────────────
+    rm          = state["risk_manager"]
+    can_trade, reason = rm.can_trade()
+
+    if not can_trade:
+        logger.warning(f"⛔ Cannot trade: {reason}")
+        return
+
+    # Jika sudah ada posisi terbuka — skip entry baru
+    if state["open_trade_id"]:
+        _manage_open_position()
+        return
+
+    # ── SIGNAL SCORING ───────────────────────────────────────
+    try:
+        funding  = get_funding_rate(SYMBOL)
+        oi_now   = get_open_interest(SYMBOL)
+        oi_prev  = state.get("prev_oi", oi_now)
+        oi_change = (oi_now - oi_prev) / oi_prev if oi_prev > 0 else 0
+        state["prev_oi"] = oi_now
+
+        signal = calculate_signal_score(
+            vp                  = state["vp"],
+            klines              = state["klines"],
+            macro_bias          = state["macro_bias"],
+            funding_rate        = funding,
+            open_interest_change= oi_change,
+        )
+    except Exception as e:
+        logger.error(f"Signal scoring error: {e}")
+        return
+
+    # Simpan sinyal ke database
+    if signal["long_signal"] or signal["short_signal"]:
+        direction = "LONG" if signal["long_signal"] else "SHORT"
+        score     = signal["long_score"] if signal["long_signal"] else signal["short_score"]
+        tier      = signal["long_tier"]  if signal["long_signal"] else signal["short_tier"]
+
+        save_signal({
+            "direction"      : direction,
+            "price"          : price,
+            "score"          : score,
+            "tier"           : tier,
+            "absorption"     : signal["absorption"]["score"] > 0,
+            "failed_auction" : signal["failed_auction"].get("bull_fa") or
+                               signal["failed_auction"].get("bear_fa"),
+            "stop_run"       : signal["stop_run"].get("bull_sr") or
+                               signal["stop_run"].get("bear_sr"),
+            "bias"           : signal["market_state"],
+            "regime"         : signal["market_state"],
+        })
+
+        notify_signal(
+            direction = direction,
+            score     = score,
+            tier      = tier,
+            reason    = ", ".join(
+                signal["long_reasons"] if signal["long_signal"]
+                else signal["short_reasons"]
+            ),
+            price     = price,
+        )
+
+        # ── ENTRY ─────────────────────────────────────────────
+        _execute_entry(signal, price, tier)
+
+
+def _execute_entry(signal: dict, price: float, tier: str):
+    """Eksekusi entry order."""
+    direction = "LONG" if signal["long_signal"] else "SHORT"
+    rm        = state["risk_manager"]
+
+    # Hitung ATR untuk SL
+    atr = calculate_atr(state["klines"], period=14)
+    if atr == 0:
+        logger.warning("ATR = 0, skip entry")
+        return
+
+    # Hitung SL/TP
+    vp  = state["vp"]
+    lvn = find_nearest_lvn(price, vp, "UP" if direction == "LONG" else "DOWN")
+
+    sl_tp = calculate_sl_tp(
+        direction   = direction,
+        entry_price = price,
+        vp          = vp,
+        atr         = atr,
+        nearest_lvn = lvn,
+    )
+
+    # Hitung position size
+    size_mult = rm.get_size_multiplier()
+    sizing    = calculate_position_size(
+        account_balance    = state["balance"],
+        entry_price        = price,
+        sl_price           = sl_tp["sl"],
+        signal_tier        = tier,
+        regime             = signal["market_state"],
+        consecutive_losses = rm.consecutive_losses,
+        session_profit     = rm.session_profit,
+    )
+
+    if sizing["quantity"] == 0:
+        logger.warning("Position size = 0, skip entry")
+        return
+
+    qty = sizing["quantity"]
+
+    logger.info(
+        f"{'🟢' if direction == 'LONG' else '🔴'} EXECUTING {direction} | "
+        f"Price: ${price:,.2f} | SL: ${sl_tp['sl']:,.2f} | "
+        f"TP2: ${sl_tp['tp2']:,.2f} | Qty: {qty:.3f} BTC | "
+        f"Risk: ${sizing['risk_usd']:.2f}"
+    )
+
+    # Place orders
+    entry_order = place_market_order(direction, qty, SYMBOL)
+    if not entry_order:
+        return
+
+    tp1_qty = round(qty * 0.40, 3)
+    tp2_qty = round(qty * 0.40, 3)
+    tp3_qty = round(qty - tp1_qty - tp2_qty, 3)
+
+    place_sl_order(direction, qty,      sl_tp["sl"],  SYMBOL)
+    place_tp_order(direction, tp1_qty,  sl_tp["tp1"], SYMBOL)
+    place_tp_order(direction, tp2_qty,  sl_tp["tp2"], SYMBOL)
+    place_tp_order(direction, tp3_qty,  sl_tp["tp3"], SYMBOL)
+
+    # Simpan ke database
+    score = (signal["long_score"] if signal["long_signal"]
+             else signal["short_score"])
+    trade_id = save_trade({
+        "direction"  : direction,
+        "entry_price": price,
+        "sl_price"   : sl_tp["sl"],
+        "tp1_price"  : sl_tp["tp1"],
+        "tp2_price"  : sl_tp["tp2"],
+        "tp3_price"  : sl_tp["tp3"],
+        "quantity"   : qty,
+        "risk_usd"   : sizing["risk_usd"],
+        "status"     : "open",
+        "tier"       : tier,
+        "score"      : score,
+        "regime"     : signal["market_state"],
+        "model_used" : "A" if signal["market_state"] != "BALANCED" else "B",
+    })
+    state["open_trade_id"] = trade_id
+
+    notify_entry(
+        direction = direction,
+        price     = price,
+        sl        = sl_tp["sl"],
+        tp1       = sl_tp["tp1"],
+        tp2       = sl_tp["tp2"],
+        tp3       = sl_tp["tp3"],
+        size      = qty,
+        risk_usd  = sizing["risk_usd"],
+        tier      = tier,
+        score     = score,
+    )
+
+
+def _manage_open_position():
+    """Monitor dan manage posisi yang sedang terbuka."""
+    pos = get_position_info(SYMBOL)
+    if not pos:
+        # Posisi sudah ditutup (SL/TP kena)
+        logger.info("Position closed (SL/TP hit)")
+        state["open_trade_id"] = None
+    else:
+        logger.debug(f"Position open: {pos['direction']} | "
+                     f"PnL: ${pos['pnl']:+.2f}")
+
+
+# ── DAILY SUMMARY ────────────────────────────────────────────
+def send_daily_summary():
+    """Kirim ringkasan performa harian ke Telegram."""
+    trades = get_today_trades()
+    wins   = sum(1 for t in trades if (t[10] or 0) > 0)
+    losses = len(trades) - wins
+    pnl    = sum((t[10] or 0) for t in trades)
+
+    notify_daily_summary(
+        date         = datetime.utcnow().strftime("%Y-%m-%d"),
+        total_trades = len(trades),
+        wins         = wins,
+        losses       = losses,
+        pnl          = pnl,
+        balance      = state["balance"],
+    )
+
+
+# ── MAIN LOOP ────────────────────────────────────────────────
+async def main_loop():
+    """Loop utama bot — cek sinyal setiap interval."""
+    logger.info("🔄 Main loop started")
+    last_summary = datetime.utcnow().date()
+
+    while state["running"]:
+        try:
+            check_and_trade()
+
+            # Daily summary jam 21:00 UTC
+            now = datetime.utcnow()
+            if now.hour == 21 and now.date() != last_summary:
+                send_daily_summary()
+                last_summary = now.date()
+
+        except KeyboardInterrupt:
+            logger.info("⛔ Bot stopped by user")
+            state["running"] = False
+            break
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            notify_error(str(e))
+
+        await asyncio.sleep(MAIN_LOOP_INTERVAL)
+
+
+async def run():
+    """Jalankan bot: WebSocket streams + main loop bersamaan."""
+    setup()
+    await asyncio.gather(
+        start_all_streams(),
+        main_loop(),
+    )
+
+
+# ── ENTRY POINT ──────────────────────────────────────────────
+if __name__ == "__main__":
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot stopped. Goodbye!")

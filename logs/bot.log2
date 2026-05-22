@@ -1,0 +1,10 @@
+✅ Config loaded | Mode: LIVE | Testnet: True | Symbol: BTCUSDT
+Traceback (most recent call last):
+  File "/root/trading_bot/main.py", line 60, in <module>
+    from strategy.entry_logic import get_entry_decision
+  File "/root/trading_bot/strategy/entry_logic.py", line 23, in <module>
+    from engine.liquidity_map import (find_liquidity_pools,
+  File "/root/trading_bot/engine/liquidity_map.py", line 95
+    )
+    ^
+SyntaxError: f-string expression part cannot include a backslash
