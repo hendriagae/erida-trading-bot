@@ -554,7 +554,9 @@ def _execute_entry(decision: dict, price: float):
         "session"     : decision.get("session_dir", ""),
         "model_used"  : model,
     })
-    state["open_trade_id"] = trade_id
+    state["open_trade_id"]     = trade_id
+    state["last_entry_price"]  = price
+    state["last_pos_direction"] = direction
 
     # Notify
     notify_entry(
@@ -601,10 +603,14 @@ def _manage_open_position(price: float):
                     )
                     logger.info(f"🚪 Exit: {actions['reason']}")
                     if result and state["open_trade_id"]:
+                        direction = state.get("last_pos_direction", "LONG")
+                        entry_p   = state.get("last_entry_price", price)
+                        pnl_pts   = (price - entry_p) if direction == "LONG" else (entry_p - price)
                         update_trade(state["open_trade_id"], {
                             "status"     : "closed",
                             "exit_price" : price,
                             "exit_reason": actions["reason"],
+                            "pnl"        : pnl_pts,
                         })
                     state["open_trade_id"]   = None
                     state["sl_tp_manager"]   = None
@@ -632,10 +638,14 @@ def _manage_open_position(price: float):
 
             # Update DB
             if state["open_trade_id"]:
+                direction = state.get("last_pos_direction", "LONG")
+                entry_p   = state.get("last_entry_price", price)
+                pnl_pts   = (price - entry_p) if direction == "LONG" else (entry_p - price)
                 update_trade(state["open_trade_id"], {
                     "status"      : "closed",
                     "exit_price"  : price,
                     "exit_reason" : "sl_tp_or_manual",
+                    "pnl"         : pnl_pts,
                 })
 
             _close_stale_db_trades("closed_in_binance")
@@ -650,10 +660,11 @@ def _manage_open_position(price: float):
             state["sl_tp_manager"]   = None
             state["_manage_errors"]  = 0
 
-            send_message(
-                "✅ <b>Posisi ditutup</b>\n"
-                "Bot siap cari setup berikutnya."
-            )
+            from monitor.telegram_alert import notify_exit
+            direction_e = state.get("last_pos_direction", "?")
+            entry_e     = state.get("last_entry_price", price)
+            pnl_e = (price-entry_e) if direction_e=="LONG" else (entry_e-price)
+            notify_exit(direction_e, entry_e, price, pnl_e, "sl_tp_or_manual")
             return
 
         # Posisi masih terbuka → update SL/TP manager
@@ -689,11 +700,11 @@ def _manage_open_position(price: float):
                 state["open_sl_order_id"] = None
                 state["sl_tp_manager"]    = None
 
-                send_message(
-                    f"🚪 <b>Posisi ditutup</b>\n"
-                    f"Alasan: {actions['reason']}\n"
-                    f"Bot siap cari setup berikutnya."
-                )
+                from monitor.telegram_alert import notify_exit
+                direction_e = state.get("last_pos_direction", pos["direction"])
+                entry_e     = state.get("last_entry_price", price)
+                pnl_e = (price-entry_e) if direction_e=="LONG" else (entry_e-price)
+                notify_exit(direction_e, entry_e, price, pnl_e, actions["reason"])
 
             elif actions["close_partial"] and actions["close_qty"] > 0:
                 from execution.order_manager import close_position
