@@ -84,6 +84,8 @@ state = {
     "last_macro_update" : 0,
     "last_daily_bias"   : 0,
     "open_trade_id"     : None,
+    "last_signal_notify" : 0,
+    "last_signal_dir"   : None,
     "open_sl_order_id"  : None,
     "running"           : True,
     "prev_oi"           : 0,
@@ -387,15 +389,21 @@ def check_and_trade():
         f"KZ: {decision.get('kill_zone')}"
     )
 
-    # Notify sinyal
-    reasons = decision.get("reasons", [])
-    notify_signal(
-        direction = direction,
-        score     = score,
-        tier      = tier,
-        reason    = ", ".join(reasons[:4]),
-        price     = price,
-    )
+    # Notify sinyal — hanya 1x per 10 menit per arah
+    reasons   = decision.get("reasons", [])
+    now       = time.time()
+    last_notif = state.get("last_signal_notify", 0)
+    last_dir   = state.get("last_signal_dir", None)
+    if direction != last_dir or (now - last_notif) > 600:
+        notify_signal(
+            direction = direction,
+            score     = score,
+            tier      = tier,
+            reason    = ", ".join(reasons[:4]),
+            price     = price,
+        )
+        state["last_signal_notify"] = now
+        state["last_signal_dir"]    = direction
 
     # Eksekusi entry
     _execute_entry(decision, price)
@@ -557,6 +565,7 @@ def _execute_entry(decision: dict, price: float):
     state["open_trade_id"]     = trade_id
     state["last_entry_price"]  = price
     state["last_pos_direction"] = direction
+    state["last_pos_quantity"]  = sizing.get("quantity", 0.001)
 
     # Notify
     notify_entry(
@@ -663,7 +672,8 @@ def _manage_open_position(price: float):
             from monitor.telegram_alert import notify_exit
             direction_e = state.get("last_pos_direction", "?")
             entry_e     = state.get("last_entry_price", price)
-            pnl_e = (price-entry_e) if direction_e=="LONG" else (entry_e-price)
+            qty_e = state.get("last_pos_quantity", 0.001)
+            pnl_e = ((price-entry_e) if direction_e=="LONG" else (entry_e-price)) * qty_e
             notify_exit(direction_e, entry_e, price, pnl_e, "sl_tp_or_manual")
             return
 
@@ -703,7 +713,8 @@ def _manage_open_position(price: float):
                 from monitor.telegram_alert import notify_exit
                 direction_e = state.get("last_pos_direction", pos["direction"])
                 entry_e     = state.get("last_entry_price", price)
-                pnl_e = (price-entry_e) if direction_e=="LONG" else (entry_e-price)
+                qty_e = state.get("last_pos_quantity", 0.001)
+                pnl_e = ((price-entry_e) if direction_e=="LONG" else (entry_e-price)) * qty_e
                 notify_exit(direction_e, entry_e, price, pnl_e, actions["reason"])
 
             elif actions["close_partial"] and actions["close_qty"] > 0:

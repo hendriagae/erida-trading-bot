@@ -48,11 +48,15 @@ def evaluate_model_a(price: float,
     # Model A hanya trade searah daily bias yang kuat
     bias      = daily_bias.get("bias", "NEUTRAL")
     htf_trend = daily_bias.get("htf_trend", "FLAT")
-    direction = ("LONG"  if bias in ["BULL", "WEAK_BULL"] else
-                 "SHORT" if bias in ["BEAR", "WEAK_BEAR"] else
-                 "LONG"  if htf_trend == "UP" else
-                 "SHORT" if htf_trend == "DOWN" else
-                 direction_hint if direction_hint else None)
+    # Prioritaskan direction_hint dari entry decision (signal scorer)
+    # Model A validasi setup, bukan tentukan arah
+    if direction_hint:
+        direction = direction_hint
+    else:
+        direction = ("LONG"  if bias in ["BULL", "WEAK_BULL"] else
+                     "SHORT" if bias in ["BEAR", "WEAK_BEAR"] else
+                     "LONG"  if htf_trend == "UP" else
+                     "SHORT" if htf_trend == "DOWN" else None)
     if not direction:
         empty["skip_reason"] = "Unclear direction"
         return empty
