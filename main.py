@@ -485,6 +485,12 @@ def _execute_entry(decision: dict, price: float):
             return
         logger.info(f"✅ RR check passed: {rr:.2f}")
 
+
+    # ── VALIDASI SL MAXIMUM 400 pts ─────────────────────────
+    if sl_dist > 400:
+        logger.warning(f"❌  SL {sl_dist:.0f} pts > max 400 — skip")
+        return
+    logger.info(f"✅  SL check passed: {sl_dist:.0f} pts")
     # Hitung size
     size_mult = (decision.get("size_mult", 1.0) *
                  rm.get_size_multiplier())
